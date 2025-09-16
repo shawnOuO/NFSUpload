@@ -1,7 +1,7 @@
 #############################################
 # 檔案來源設定
 #############################################
-source.paths="C:\ProgramData\National Instruments\NI STS Maintenance\vault​","C:\ProgramData\National Instruments\NI STS Maintenance\logs\SwitchCounts\​",C:/GIT/data/*
+source.paths="C:/ProgramData/National Instruments/NI STS Maintenance/vault","C:/ProgramData/National Instruments/NI STS Maintenance/logs/SwitchCounts",C:/GIT/data/*
 
 source.expand.depth=1
 
