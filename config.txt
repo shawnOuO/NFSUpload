@@ -1,0 +1,38 @@
+# 三個來源路徑（以逗號分隔）。可用絕對路徑；若含空白請加引號。
+source.paths=C:/data/A,C:/data/B,C:/data/C
+
+
+# 壓縮檔輸出目錄（會自動建立）。
+zip.output.dir=out
+
+
+# 以檔案「最後修改時間」判定是否為前一天（true/false）。
+# 若你的檔名含日期並要用檔名判定，請改成 false 並自行延伸邏輯（見 Main.java 註解）。
+select.by.lastModified=true
+
+
+# 指定時區（前一天的計算以此為準）。
+timezone=Asia/Taipei
+
+
+# 產出遠端目錄名稱的日期格式（通常用於 /base/yyyyMMdd）。
+remote.dir.date.pattern=yyyyMMdd
+
+
+# FTP 參數
+ftp.host=127.0.0.1
+ftp.port=21
+ftp.username=your_user
+ftp.password=your_password
+ftp.remote.base=/upload
+ftp.passive=true
+ftp.connect.timeout.ms=15000
+ftp.data.timeout.ms=30000
+
+
+# 乾跑模式：true 時不會真的上傳，只列印將作業的清單與輸出 zip。
+dry.run=false
+
+
+# 若遠端以每日一層目錄存放，true 則會在 ftp.remote.base 下再加 yyyyMMdd 目錄。
+remote.append.date.dir=true
