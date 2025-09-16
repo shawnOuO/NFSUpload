@@ -2,12 +2,16 @@ import java.io.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.regex.Pattern;
+import java.net.InetAddress;
+import java.util.zip.*;
 
 public class Main {
 
     // ====== 第 1 段開始：初始化 + 設定載入 + 昨天區間 + 來源路徑解析 ======
     public static void main(String[] args) {
-        String propPath = (args != null && args.length > 0) ? args[0] : "app.properties";
+        // 預設讀取 config.txt（可用參數覆寫）
+        String propPath = (args != null && args.length > 0) ? args[0] : "config.txt";
+
         Properties p = new Properties();
         InputStream in = null;
         try {
@@ -20,24 +24,35 @@ public class Main {
             closeQuietly(in);
         }
 
-        // 設定讀取
-        String sourcePathsCsv   = p.getProperty("source.paths", "");
-        int    expandDepth      = parseInt(p.getProperty("source.expand.depth", "0"), 0);
-        String subdirRegexStr   = p.getProperty("source.subdir.regex", "^.+$");
-        String excludeRegexStr  = p.getProperty("source.exclude.regex", "");
-        String timezoneId       = p.getProperty("timezone", "Asia/Taipei");
+        //==== 讀取你提供的關鍵設定 ====
+        String sourcePathsCsv  = p.getProperty("source.paths", "");
+        int    expandDepth     = parseInt(p.getProperty("source.expand.depth", "0"), 0);
 
-        // 計算「昨天」時間區間 [yStart, todayStart)
+        // 白/黑名單是可選設定；你目前的 config 沒設也沒關係
+        String includeRegexStr = p.getProperty("source.subdir.regex", "^.+$"); // 預設全收
+        String excludeRegexStr = p.getProperty("source.exclude.regex", "");    // 預設不排除
+
+        // 時區與「昨天」的時間區間
+        String timezoneId      = p.getProperty("timezone", "Asia/Taipei");
         TimeZone tz = TimeZone.getTimeZone(timezoneId);
-        long[] range = computeYesterdayRange(tz);
+        long[] range = computeYesterdayRange(tz); // [昨日00:00, 今日00:00)
         long startMillis = range[0];
         long endMillis   = range[1];
 
-        // 展開來源根目錄（支援萬用字元 * 與白/黑名單）
+        // 日期字串（也會用在壓縮檔名）
+        String remoteDatePattern = p.getProperty("remote.dir.date.pattern", "yyyyMMdd");
+        SimpleDateFormat ymd = new SimpleDateFormat(remoteDatePattern);
+        ymd.setTimeZone(tz);
+        String dateStr = ymd.format(new Date(startMillis));
+
+        // 預設壓縮策略（你要「合成一顆」），之後第2段會用到
+        String combineMode = p.getProperty("zip.combine.mode", "single");
+
+        //==== 展開來源根目錄（支援 C:/GIT/data/* 的一層展開） ====
         List<File> baseDirs = parseAndExpandSourcePaths(
                 sourcePathsCsv,
                 expandDepth,
-                subdirRegexStr,
+                includeRegexStr,
                 excludeRegexStr
         );
 
@@ -46,16 +61,244 @@ public class Main {
             return;
         }
 
-        // 先列印確認（之後第 2 段會在這些 baseDirs 上做「收檔 + 壓縮」）
+        // 列印確認
+        log("時區: " + timezoneId + "；昨天區間: " + new Date(startMillis) + " ~ " + new Date(endMillis));
+        log("zip.combine.mode=" + combineMode + "（single=所有來源合成一顆壓縮檔）");
         log("本次來源根目錄（展開後）共 " + baseDirs.size() + " 個：");
         for (int i = 0; i < baseDirs.size(); i++) {
             log("  - " + baseDirs.get(i).getAbsolutePath());
         }
 
-        // TODO：第 2 段：收集昨天檔案 + 逐個 baseDir 壓縮成 zip
-        // TODO：第 3 段：FTP 連線 + 建立遠端目錄 + 上傳 zip
+        // 預告一下將來壓縮檔名（實際壓縮在第 2 段執行）
+        String hostname = getHostname();
+        log("預計壓縮檔名（single 模式）： " + hostname + "_" + dateStr + ".zip");
 
-        // 先到此收尾；完整流程會在貼完第 2/3 段後串起來
+        // === 第 2 段開始：收集前一天檔案 + 壓縮（Hybrid：固定路徑各一顆；* 展開合併一顆） ===
+        String zipOutDir = p.getProperty("zip.output.dir", "out");
+        File outDir = new File(zipOutDir);
+        if (!outDir.exists()) { outDir.mkdirs(); }
+
+        String stagingBase = p.getProperty("staging.base.dir", "staging");
+        boolean stagingCleanup = Boolean.parseBoolean(p.getProperty("staging.cleanup", "false"));
+        File stagingBaseDir = new File(stagingBase);
+        if (!stagingBaseDir.exists()) { stagingBaseDir.mkdirs(); }
+
+        ymd.setTimeZone(tz);
+
+        // 重新依 source.paths 拆成：固定路徑 vs 萬用字元父層
+        List<String> tokens = splitCsv(sourcePathsCsv);
+        List<File> fixedRoots = new ArrayList<File>();
+        List<File> globParents = new ArrayList<File>();
+
+        for (int i = 0; i < tokens.size(); i++) {
+            String norm = sanitizeToken(tokens.get(i));
+            if (norm.length() == 0) continue;
+            if (norm.endsWith("/*")) {
+                File parent = new File(norm.substring(0, norm.length() - 2));
+                if (parent.isDirectory()) {
+                    globParents.add(parent);
+                } else {
+                    log("展開根目錄不存在或不是資料夾，略過: " + parent.getAbsolutePath());
+                }
+            } else {
+                File f = new File(norm);
+                if (f.exists() && f.isDirectory()) fixedRoots.add(f);
+                else log("來源路徑不存在或非資料夾，略過: " + f.getAbsolutePath());
+            }
+        }
+
+        List<File> zipsToUpload = new ArrayList<File>();
+        List<File> stagingRoots = new ArrayList<File>(); // 供清理用
+
+        // 1) 固定路徑：各建立一個 staging/<basename>_yyyyMMdd，搬移昨天檔案進去，再各自壓一顆 zip
+        for (int i = 0; i < fixedRoots.size(); i++) {
+            File base = fixedRoots.get(i);
+            List<File> selected = new ArrayList<File>();
+            collectFilesByLastModified(base, startMillis, endMillis, selected);
+            if (selected.isEmpty()) {
+                log("→ [" + base.getName() + "] 無前一天檔案，略過搬移與壓縮。");
+                continue;
+            }
+            File stagingRoot = new File(stagingBaseDir, base.getName() + "_" + dateStr);
+            ensureDir(stagingRoot);
+            stagingRoots.add(stagingRoot);
+
+            // 搬移（保留相對於 base 的路徑結構）
+            String baseAbs = base.getAbsolutePath();
+            for (int j = 0; j < selected.size(); j++) {
+                File src = selected.get(j);
+                String rel = toRelativePath(baseAbs, src.getAbsolutePath());
+                File dst = new File(stagingRoot, rel);
+                ensureDir(dst.getParentFile());
+                try {
+                    moveFileWithFallback(src, dst);
+                } catch (IOException e) {
+                    log("搬移失敗: " + src.getAbsolutePath() + " -> " + dst.getAbsolutePath() + "，原因: " + e.getMessage());
+                }
+            }
+
+            // 壓縮 stagingRoot → out/<basename>_yyyyMMdd.zip
+            File zipFile = new File(outDir, base.getName() + "_" + dateStr + ".zip");
+            try {
+                zipFolder(stagingRoot, zipFile);
+            } catch (IOException e) {
+                log("壓縮失敗(perBase): " + stagingRoot.getAbsolutePath() + " -> " + zipFile.getAbsolutePath() + "，原因: " + e.getMessage());
+            }
+            log("→ 已建立壓縮檔: " + zipFile.getAbsolutePath() + " (" + zipFile.length() + " bytes)");
+            zipsToUpload.add(zipFile);
+        }
+
+        // 2) C:/GIT/data/*：建立 staging/{hostname}_yyyyMMdd，將每個 tester 的昨天檔搬到對應子資料夾，再合併壓一顆
+        if (!globParents.isEmpty()) {
+            Pattern includePattern = null;
+            Pattern excludePattern = null;
+            try { includePattern = Pattern.compile(includeRegexStr); } catch (Exception ignore) {}
+            try { if (excludeRegexStr != null && excludeRegexStr.length() > 0) excludePattern = Pattern.compile(excludeRegexStr); } catch (Exception ignore) {}
+
+            File mergedStagingRoot = new File(stagingBaseDir, hostname + "_" + dateStr);
+            boolean hasAny = false;
+
+            for (int g = 0; g < globParents.size(); g++) {
+                File parent = globParents.get(g);
+
+                List<File> testers = new ArrayList<File>();
+                expandOneLevel(parent, expandDepth, includePattern, excludePattern, testers);
+                for (int t = 0; t < testers.size(); t++) {
+                    File testerRoot = testers.get(t);
+                    List<File> selected = new ArrayList<File>();
+                    collectFilesByLastModified(testerRoot, startMillis, endMillis, selected);
+                    if (selected.isEmpty()) continue;
+
+                    hasAny = true;
+                    File testerStage = new File(mergedStagingRoot, testerRoot.getName());
+                    ensureDir(testerStage);
+
+                    String baseAbs = testerRoot.getAbsolutePath();
+                    for (int j = 0; j < selected.size(); j++) {
+                        File src = selected.get(j);
+                        String rel = toRelativePath(baseAbs, src.getAbsolutePath());
+                        File dst = new File(testerStage, rel);
+                        ensureDir(dst.getParentFile());
+                        try {
+                            moveFileWithFallback(src, dst);
+                        } catch (IOException e) {
+                            log("搬移失敗: " + src.getAbsolutePath() + " -> " + dst.getAbsolutePath() + "，原因: " + e.getMessage());
+                        }
+                    }
+                }
+            }
+
+            if (hasAny) {
+                ensureDir(mergedStagingRoot);
+                stagingRoots.add(mergedStagingRoot);
+                File mergedZip = new File(outDir, hostname + "_" + dateStr + ".zip");
+                try{
+                    zipFolder(mergedStagingRoot, mergedZip);
+                }
+                catch (IOException e) {
+                    log("壓縮失敗(merged): " + mergedStagingRoot.getAbsolutePath() + " -> " + mergedZip.getAbsolutePath() + "，原因: " + e.getMessage());
+                }
+                
+                log("→ 已建立合併壓縮檔: " + mergedZip.getAbsolutePath() + " (" + mergedZip.length() + " bytes)");
+                zipsToUpload.add(mergedZip);
+            } else {
+                log("→ [* 合併] 無前一天檔案，略過 staging 與壓縮。");
+            }
+        }
+
+        // 若需要在壓縮完成後清空 staging
+        if (stagingCleanup) {
+            for (int i = 0; i < stagingRoots.size(); i++) {
+                deleteDirectoryRecursive(stagingRoots.get(i));
+            }
+            // 若整個 staging 目錄已空，可嘗試清掉 root（可選）
+            // deleteDirectoryRecursive(stagingBaseDir);
+        }
+        // === 第 2 段結束：已產生 zipsToUpload 可供上傳 ===
+
+
+        // TODO（第 3 段）：FTP 連線 + 遞迴建立遠端目錄 + 上傳 zip
+        // === 第 3 段開始：FTP 上傳 ===
+        String ftpHost = p.getProperty("ftp.host", "");
+        int    ftpPort = parseInt(p.getProperty("ftp.port", "21"), 21);
+        String ftpUser = p.getProperty("ftp.username", "");
+        String ftpPass = p.getProperty("ftp.password", "");
+        String ftpRemoteBaseRaw = p.getProperty("ftp.remote.base", "/upload");
+        boolean ftpPassive = Boolean.parseBoolean(p.getProperty("ftp.passive", "true"));
+        int connectTimeout = parseInt(p.getProperty("ftp.connect.timeout.ms", "15000"), 15000);
+        int dataTimeout = parseInt(p.getProperty("ftp.data.timeout.ms", "30000"), 30000);
+        boolean remoteAppendDateDir = Boolean.parseBoolean(p.getProperty("remote.append.date.dir", "true"));
+
+        boolean dryRun = Boolean.parseBoolean(p.getProperty("dry.run", "false"));
+
+        if (zipsToUpload.isEmpty()) {
+            log("沒有可上傳的壓縮檔，結束。");
+            return;
+        }
+
+        String ftpRemoteBase = replaceHostnameVars(ftpRemoteBaseRaw, hostname); // 支援 {hostname}
+        String remoteDir = ftpRemoteBase;
+        if (remoteAppendDateDir) remoteDir = ftpRemoteBase + "/" + dateStr;
+
+        if (dryRun) {
+            log("dry.run=true，僅列出將上傳的檔案與遠端目錄：");
+            log("  遠端目錄: " + remoteDir);
+            for (int i = 0; i < zipsToUpload.size(); i++) {
+                log("  - " + zipsToUpload.get(i).getAbsolutePath());
+            }
+            return;
+        }
+
+        // 連線與上傳
+        org.apache.commons.net.ftp.FTPClient ftp = new org.apache.commons.net.ftp.FTPClient();
+        try {
+            ftp.setConnectTimeout(connectTimeout);
+            ftp.setDefaultTimeout(connectTimeout);
+            ftp.setDataTimeout(dataTimeout);
+            ftp.setControlEncoding("UTF-8");
+
+            log("連線 FTP: " + ftpHost + ":" + ftpPort);
+            ftp.connect(ftpHost, ftpPort);
+            int reply = ftp.getReplyCode();
+            if (!org.apache.commons.net.ftp.FTPReply.isPositiveCompletion(reply)) {
+                throw new IOException("FTP 連線被拒絕, replyCode=" + reply);
+            }
+
+            if (!ftp.login(ftpUser, ftpPass)) {
+                throw new IOException("FTP 登入失敗，請檢查帳密。");
+            }
+
+            if (ftpPassive) ftp.enterLocalPassiveMode();
+            ftp.setFileType(org.apache.commons.net.ftp.FTP.BINARY_FILE_TYPE);
+            ftp.setBufferSize(8192);
+
+            ensureRemoteDirectory(ftp, remoteDir);
+            log("遠端上傳目錄: " + remoteDir);
+
+            for (int i = 0; i < zipsToUpload.size(); i++) {
+                File zf = zipsToUpload.get(i);
+                String remotePath = remoteDir + "/" + zf.getName();
+                log("上傳: " + zf.getName());
+                BufferedInputStream bis = null;
+                try {
+                    bis = new BufferedInputStream(new FileInputStream(zf));
+                    boolean ok = ftp.storeFile(remotePath, bis);
+                    if (!ok) throw new IOException("storeFile 失敗: " + ftp.getReplyString());
+                } finally {
+                    closeQuietly(bis);
+                }
+            }
+            log("全部上傳完成。");
+        } catch (Exception e) {
+            log("FTP 發生錯誤: " + e.getMessage());
+        } finally {
+            if (ftp.isConnected()) {
+                try { ftp.logout(); } catch (Exception ignore) {}
+                try { ftp.disconnect(); } catch (Exception ignore) {}
+            }
+        }
+        // === 第 3 段結束 ===
+
     }
 
     // 解析並展開 source.paths，支援像 C:/GIT/data/* 這種一層展開
@@ -71,17 +314,18 @@ public class Main {
         try { includePattern = Pattern.compile(includeRegexStr); } catch (Exception ignore) {}
         try { if (excludeRegexStr != null && excludeRegexStr.length() > 0) excludePattern = Pattern.compile(excludeRegexStr); } catch (Exception ignore) {}
 
-        String[] tokens = csv.split(",");
-        for (int i = 0; i < tokens.length; i++) {
-            String raw = tokens[i].trim();
-            if (raw.length() == 0) continue;
+        // 簡易 CSV 切分（支援用引號包住含空白的路徑）
+        List<String> tokens = splitCsv(csv);
 
-            // 標準化路徑分隔符
-            String norm = raw.replace('\\', '/');
+        for (int i = 0; i < tokens.size(); i++) {
+            String raw = tokens.get(i);
+            String norm = sanitizeToken(raw); // 去引號、去零寬字元、標準化斜線
+
+            if (norm.length() == 0) continue;
 
             if (norm.endsWith("/*")) {
-                // 只支援「尾端一層 * 」的展開（C:/GIT/data/*）
-                String parent = norm.substring(0, norm.length() - 2); // 去掉 "/*"
+                // 只支援「尾端一層 * 」的展開（例：C:/GIT/data/*）
+                String parent = norm.substring(0, norm.length() - 2);
                 File parentDir = new File(parent);
                 if (!parentDir.isDirectory()) {
                     log("展開根目錄不存在或不是資料夾，略過: " + parentDir.getAbsolutePath());
@@ -94,12 +338,40 @@ public class Main {
                 if (f.exists() && f.isDirectory()) {
                     result.add(f);
                 } else {
-                    log("來源路徑不存在或非資料夾，略過: " + f.getAbsolutePath());
+                    log("來源路徑不存在或非資料夾，略過: " + f.getPath());
                 }
             }
         }
         return result;
     }
+
+    // 以最後修改時間篩選 [startMillis, endMillis)
+    private static void collectFilesByLastModified(File base, long startMillis, long endMillis, List<File> out) {
+        File[] list = base.listFiles();
+        if (list == null) return;
+        for (int i = 0; i < list.length; i++) {
+            File f = list[i];
+            if (f.isDirectory()) {
+                collectFilesByLastModified(f, startMillis, endMillis, out);
+            } else {
+                long lm = f.lastModified();
+                if (lm >= startMillis && lm < endMillis) {
+                    out.add(f);
+                }
+            }
+        }
+    }
+
+    // 生成相對路徑：不同磁碟/前綴則退回檔名
+    private static String toRelativePath(String baseAbs, String targetAbs) {
+        if (targetAbs.startsWith(baseAbs)) {
+            String rel = targetAbs.substring(baseAbs.length());
+            while (rel.startsWith(File.separator)) rel = rel.substring(1);
+            return rel.length() == 0 ? new File(targetAbs).getName() : rel;
+        }
+        return new File(targetAbs).getName();
+    }
+
 
     // 依 expandDepth 展開資料夾；對於 C:/GIT/data/*，通常設 expandDepth=1
     private static void expandOneLevel(File root,
@@ -108,11 +380,9 @@ public class Main {
                                        Pattern excludePattern,
                                        List<File> out) {
         if (depth <= 0) {
-            // 不展開就直接加入 root（理論上不會用到此分支，保留以防設定錯誤）
             if (root.isDirectory()) out.add(root);
             return;
         }
-        // BFS/DFS 任一即可；這裡只展開一層時直接 listFiles
         File[] kids = root.listFiles();
         if (kids == null) return;
         for (int i = 0; i < kids.length; i++) {
@@ -121,23 +391,20 @@ public class Main {
 
             String name = k.getName();
             if (excludePattern != null && excludePattern.matcher(name).matches()) {
-                // 黑名單命中 → 排除
-                continue;
+                continue; // 黑名單
             }
             if (includePattern != null && !includePattern.matcher(name).matches()) {
-                // 不在白名單 → 排除
-                continue;
+                continue; // 非白名單
             }
             out.add(k);
 
-            // 若要展開到更深層，可遞減 depth 並遞迴（此案通常 depth=1，不再深入）
             if (depth > 1) {
                 expandOneLevel(k, depth - 1, includePattern, excludePattern, out);
             }
         }
     }
 
-    // 昨天的 [00:00, 今天 00:00)
+    // ===== 工具：昨天時間區間 =====
     private static long[] computeYesterdayRange(TimeZone tz) {
         Calendar cal = Calendar.getInstance(tz);
         cal.set(Calendar.HOUR_OF_DAY, 0);
@@ -150,7 +417,184 @@ public class Main {
         return new long[]{ yStart, todayStart };
     }
 
-    // 基本工具
+    // ===== 工具：CSV 切分（支援引號）=====
+    private static List<String> splitCsv(String s) {
+        List<String> out = new ArrayList<String>();
+        if (s == null) return out;
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"') {
+                inQuote = !inQuote;
+                continue;
+            }
+            if (c == ',' && !inQuote) {
+                out.add(cur.toString());
+                cur.setLength(0);
+            } else {
+                cur.append(c);
+            }
+        }
+        out.add(cur.toString());
+        return out;
+    }
+
+    // ===== 工具：清理路徑 token（去引號/零寬字元/換行；標準化斜線）=====
+    private static String sanitizeToken(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+
+        // 去頭尾雙引號
+        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
+            s = s.substring(1, s.length() - 1);
+        }
+
+        // 移除常見不可見字元（零寬空白、BOM 等）
+        // \u200B: ZERO WIDTH SPACE, \uFEFF: BOM
+        s = s.replace("\u200B", "").replace("\uFEFF", "");
+
+        // 去除換行與 \r
+        s = s.replace("\r", "").replace("\n", "");
+
+        // Windows 路徑標準化成使用 '/'
+        s = s.replace('\\', '/');
+
+        // 去掉尾端多餘空白
+        s = s.trim();
+        return s;
+    }
+
+    // ===== 工具：Hostname（壓縮檔名會用到）=====
+    private static String getHostname() {
+        String hn = System.getenv("COMPUTERNAME");
+        if (hn == null || hn.length() == 0) hn = System.getenv("HOSTNAME");
+        if (hn == null || hn.length() == 0) {
+            try { hn = InetAddress.getLocalHost().getHostName(); } catch (Exception ignore) {}
+        }
+        if (hn == null || hn.length() == 0) hn = "UNKNOWNHOST";
+        return hn;
+    }
+
+    // 建立資料夾（若不存在）
+    private static void ensureDir(File dir) {
+        if (dir != null && !dir.exists()) dir.mkdirs();
+    }
+
+    // 將檔案搬移到目標（跨磁碟自動 fallback 成 copy+delete）
+    private static void moveFileWithFallback(File src, File dst) throws IOException {
+        if (dst.exists() && !dst.isDirectory()) {
+            // 直接覆蓋（保守作法：先刪除，再搬移）
+            if (!dst.delete()) {
+                throw new IOException("無法覆寫目的檔案: " + dst.getAbsolutePath());
+            }
+        }
+        // 先嘗試 rename（同磁碟最有效率）
+        if (src.renameTo(dst)) return;
+
+        // 跨磁碟：改用 copy + delete
+        BufferedInputStream in = null;
+        BufferedOutputStream out = null;
+        try {
+            in = new BufferedInputStream(new FileInputStream(src));
+            ensureDir(dst.getParentFile());
+            out = new BufferedOutputStream(new FileOutputStream(dst));
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        } finally {
+            closeQuietly(in);
+            closeQuietly(out);
+        }
+        if (!src.delete()) {
+            // 若刪不掉，至少不要留兩份；可視需要改成記錄警告
+            throw new IOException("搬移後無法刪除來源檔: " + src.getAbsolutePath());
+        }
+    }
+
+    // 將整個資料夾內容壓縮成 ZIP（ZIP 內路徑為相對於 root 的路徑；不含最外層資料夾名）
+    private static void zipFolder(File root, File zipFile) throws IOException {
+        java.util.zip.ZipOutputStream zos = null;
+        try {
+            zos = new java.util.zip.ZipOutputStream(new BufferedOutputStream(new FileOutputStream(zipFile)));
+            String baseAbs = root.getAbsolutePath();
+            zipFolderRecursive(root, baseAbs, zos);
+        } finally {
+            closeQuietly(zos);
+        }
+    }
+    
+    private static void zipFolderRecursive(File cur, String baseAbs, java.util.zip.ZipOutputStream zos) throws IOException {
+        File[] list = cur.listFiles();
+        if (list == null) return;
+        byte[] buf = new byte[8192];
+
+        for (int i = 0; i < list.length; i++) {
+            File f = list[i];
+            if (f.isDirectory()) {
+                zipFolderRecursive(f, baseAbs, zos);
+            } else {
+                String abs = f.getAbsolutePath();
+                String rel = abs.startsWith(baseAbs) ? abs.substring(baseAbs.length()) : f.getName();
+                while (rel.startsWith(File.separator)) rel = rel.substring(1);
+                rel = rel.replace('\\', '/');
+                java.util.zip.ZipEntry ze = new java.util.zip.ZipEntry(rel);
+                ze.setTime(f.lastModified());
+                zos.putNextEntry(ze);
+                BufferedInputStream in = null;
+                try {
+                    in = new BufferedInputStream(new FileInputStream(f));
+                    int n;
+                    while ((n = in.read(buf)) != -1) zos.write(buf, 0, n);
+                } finally {
+                    closeQuietly(in);
+                    zos.closeEntry();
+                }
+            }
+        }
+    }
+
+    // 遞迴刪除資料夾（for staging.cleanup=true）
+    private static void deleteDirectoryRecursive(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) for (int i = 0; i < kids.length; i++) deleteDirectoryRecursive(kids[i]);
+        }
+        try { f.delete(); } catch (Exception ignore) {}
+    }
+
+    // FTP 目錄建立（逐層，容錯）
+    private static void ensureRemoteDirectory(org.apache.commons.net.ftp.FTPClient ftp, String remoteDir) throws IOException {
+        remoteDir = normalizeRemotePath(remoteDir);
+        String[] parts = remoteDir.split("/");
+        String path = "";
+        for (int i = 0; i < parts.length; i++) {
+            String seg = parts[i];
+            if (seg == null || seg.length() == 0) continue;
+            path += "/" + seg;
+            if (!ftp.changeWorkingDirectory(path)) {
+                if (!ftp.makeDirectory(path) && !ftp.changeWorkingDirectory(path)) {
+                    throw new IOException("建立/切換遠端目錄失敗: " + path + ", reply=" + ftp.getReplyString());
+                }
+            }
+        }
+    }
+    private static String normalizeRemotePath(String p) {
+        if (p == null || p.length() == 0) return "/";
+        p = p.replace('\\', '/');
+        while (p.contains("//")) p = p.replace("//", "/");
+        if (!p.startsWith("/")) p = "/" + p;
+        if (p.endsWith("/") && p.length() > 1) p = p.substring(0, p.length() - 1);
+        return p;
+    }
+    private static String replaceHostnameVars(String s, String hostname) {
+        if (s == null) return null;
+        return s.replace("{hostname}", hostname);
+    }
+
+
+    // ===== 基本工具 =====
     private static int parseInt(String s, int def) {
         try { return Integer.parseInt(s); } catch (Exception e) { return def; }
     }
