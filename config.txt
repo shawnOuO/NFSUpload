@@ -45,3 +45,25 @@ ftp.data.timeout.ms=30000
 remote.append.date.dir=true
 
 dry.run=true
+
+#############################################
+# Logging
+#############################################
+# 日誌目錄（相對於執行目錄）
+log.dir=logs
+
+# 檔名樣式：支援 %yyyyMMdd% 之類日期占位符；每天自動換新檔
+log.filename.pattern=app_%yyyyMMdd%.log
+
+# INFO | WARN | ERROR | DEBUG
+log.level=INFO
+
+# 是否也輸出到主控台（System.out/System.err）
+log.console=true
+
+# 單檔上限（MiB），超過即輪替為 .1、.2 ...（最多 log.rotate.max.backups 份）
+log.rotate.max.size.mb=10
+log.rotate.max.backups=7
+
+# 檔案編碼
+log.charset=UTF-8
