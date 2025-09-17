@@ -1,8 +1,8 @@
 #############################################
 # 檔案來源設定
 #############################################
-source.paths="C:/ProgramData/National Instruments/NI STS Maintenance/vault","C:/ProgramData/National Instruments/NI STS Maintenance/logs/SwitchCounts",C:/GIT/data/*
-
+# source.paths="C:/ProgramData/National Instruments/NI STS Maintenance/vault","C:/ProgramData/National Instruments/NI STS Maintenance/logs/SwitchCounts",C:/GIT/data/*
+source.paths=C:/Users/shawn/work/NFSUpload/test_data
 source.expand.depth=1
 
 #############################################
@@ -20,9 +20,11 @@ timezone=Asia/Taipei
 zip.output.dir=out
 remote.dir.date.pattern=yyyyMMdd
 
-IP: 10.185.137.28
-user/account : ifx/ifx11
-path: /att6-1/ifx/engr/.caldata
+staging.base.dir=staging
+# （可選）壓縮與上傳完成後是否清空 staging 目錄
+# 預設 false；若要自動清掉就改 true
+staging.cleanup=false
+
 #############################################
 # FTP 連線
 #############################################
@@ -41,3 +43,5 @@ ftp.connect.timeout.ms=15000
 ftp.data.timeout.ms=30000
 
 remote.append.date.dir=true
+
+dry.run=true
